@@ -480,6 +480,40 @@ class MiniGridEnv(gym.Env):
 
         return (topX, topY, botX, botY)
 
+    def get_view_exts_fiction(self, temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos, agent_view_size=None):
+        """
+        Get the extents of the square set of tiles visible to the agent
+        Note: the bottom extent indices are not included in the set
+        if agent_view_size is None, use self.agent_view_size
+        """
+
+        agent_view_size = agent_view_size or self.agent_view_size
+
+        # Facing right
+        if temp_agent_dir == 0:
+            topX = temp_agent_pos[0]
+            topY = temp_agent_pos[1] - agent_view_size // 2
+        # Facing down
+        elif temp_agent_dir == 1:
+            topX = temp_agent_pos[0] - agent_view_size // 2
+            topY = temp_agent_pos[1]
+        # Facing left
+        elif temp_agent_dir == 2:
+            topX = temp_agent_pos[0] - agent_view_size + 1
+            topY = temp_agent_pos[1] - agent_view_size // 2
+        # Facing up
+        elif temp_agent_dir == 3:
+            topX = temp_agent_pos[0] - agent_view_size // 2
+            topY = temp_agent_pos[1] - agent_view_size + 1
+        else:
+            assert False, "invalid agent direction"
+
+        botX = topX + agent_view_size
+        botY = topY + agent_view_size
+
+        return (topX, topY, botX, botY)
+
+
     def relative_coords(self, x, y):
         """
         Check if a grid position belongs to the agent's field of view, and returns the corresponding coordinates
@@ -518,6 +552,84 @@ class MiniGridEnv(gym.Env):
         assert world_cell is not None
 
         return obs_cell is not None and obs_cell.type == world_cell.type
+
+    def step_fiction(self, action):
+        #self.step_count += 1
+
+        reward = 0
+        terminated = False
+        truncated = False
+
+        # Get the position in front of the agent
+        fwd_pos = self.front_pos
+
+        # Get the contents of the cell in front of the agent
+        fwd_cell = self.grid.get(*fwd_pos)
+
+        # make a temporary copy of the self.agent_dir and self.agent_pos
+        temp_agent_dir = self.agent_dir
+        temp_agent_pos = self.agent_pos
+
+        # make a temporary copy of the self.carrying and self.carrying.cur_pos
+        temp_carrying = self.carrying
+        temp_carrying_cur_pos = self.carrying.cur_pos
+
+        # Rotate left
+        if action == self.actions.left:
+            temp_agent_dir -= 1
+            if temp_agent_dir < 0:
+                temp_agent_dir += 4
+
+        # Rotate right
+        elif action == self.actions.right:
+            temp_agent_dir = (temp_agent_dir + 1) % 4
+
+        # Move forward
+        elif action == self.actions.forward:
+            if fwd_cell is None or fwd_cell.can_overlap():
+                temp_agent_pos = tuple(fwd_pos)
+            if fwd_cell is not None and fwd_cell.type == "goal":
+                terminated = True
+                reward = self._reward()
+            if fwd_cell is not None and fwd_cell.type == "lava":
+                terminated = True
+
+        # Pick up an object
+        elif action == self.actions.pickup:
+            if fwd_cell and fwd_cell.can_pickup():
+                if self.carrying is None:
+                    self.carrying = fwd_cell
+                    self.carrying.cur_pos = np.array([-1, -1])
+                    self.grid.set(fwd_pos[0], fwd_pos[1], None)
+
+        # Drop an object
+        elif action == self.actions.drop:
+            if not fwd_cell and self.carrying:
+                self.grid.set(fwd_pos[0], fwd_pos[1], temp_carrying)
+                temp_carrying_cur_pos = fwd_pos
+                temp_carrying = None
+
+        # Toggle/activate an object
+        elif action == self.actions.toggle:
+            if fwd_cell:
+                fwd_cell.toggle(self, fwd_pos)
+
+        # Done action (not used by default)
+        elif action == self.actions.done:
+            pass
+
+        else:
+            raise ValueError(f"Unknown action: {action}")
+
+        #if self.step_count >= self.max_steps:
+        #    truncated = True
+
+        if self.render_mode == "human":
+            self.render()
+
+        obs = self.gen_obs_fiction(temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos)
+
+        return obs, reward, terminated, truncated, {}
 
     def step(self, action):
         self.step_count += 1
@@ -626,12 +738,68 @@ class MiniGridEnv(gym.Env):
 
         return grid, vis_mask
 
+    def gen_obs_grid_fiction(self, temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos, agent_view_size=None):
+        """
+        Generate the sub-grid observed by the agent.
+        This method also outputs a visibility mask telling us which grid
+        cells the agent can actually see.
+        if agent_view_size is None, self.agent_view_size is used
+        """
+
+        topX, topY, botX, botY = self.get_view_exts_fiction(temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos, agent_view_size)
+
+        agent_view_size = agent_view_size or self.agent_view_size
+
+        grid = self.grid.slice(topX, topY, agent_view_size, agent_view_size)
+
+        for i in range(temp_agent_dir + 1):
+            grid = grid.rotate_left()
+
+        # Process occluders and visibility
+        # Note that this incurs some performance cost
+        if not self.see_through_walls:
+            vis_mask = grid.process_vis(
+                agent_pos=(agent_view_size // 2, agent_view_size - 1)
+            )
+        else:
+            vis_mask = np.ones(shape=(grid.width, grid.height), dtype=bool)
+
+        # Make it so the agent sees what it's carrying
+        # We do this by placing the carried object at the agent's position
+        # in the agent's partially observable view
+        agent_pos = grid.width // 2, grid.height - 1
+        #temp_carrying = self.carrying
+        if temp_carrying:
+            grid.set(*agent_pos, temp_carrying)
+        else:
+            grid.set(*agent_pos, None)
+
+        return grid, vis_mask
+
     def gen_obs(self):
         """
         Generate the agent's view (partially observable, low-resolution encoding)
         """
 
         grid, vis_mask = self.gen_obs_grid()
+
+        # Encode the partially observable view into a numpy array
+        image = grid.encode(vis_mask)
+
+        # Observations are dictionaries containing:
+        # - an image (partially observable view of the environment)
+        # - the agent's direction/orientation (acting as a compass)
+        # - a textual mission string (instructions for the agent)
+        obs = {"image": image, "direction": self.agent_dir, "mission": self.mission}
+
+        return obs
+
+    def gen_obs_fiction(self, temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos):
+        """
+        Generate the agent's view (partially observable, low-resolution encoding)
+        """
+
+        grid, vis_mask = self.gen_obs_grid_fiction(temp_agent_pos, temp_agent_dir, temp_carrying, temp_carrying_cur_pos)
 
         # Encode the partially observable view into a numpy array
         image = grid.encode(vis_mask)
@@ -749,3 +917,4 @@ class MiniGridEnv(gym.Env):
     def close(self):
         if self.window:
             self.window.close()
+
