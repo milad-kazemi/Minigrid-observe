@@ -33,6 +33,7 @@ class Grid:
         self.height: int = height
 
         self.grid: list[WorldObj | None] = [None] * (width * height)
+        self.grid_temp: list[WorldObj | None] = [None] * (width * height)
 
     def __contains__(self, key: Any) -> bool:
         if isinstance(key, WorldObj):

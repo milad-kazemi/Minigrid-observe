@@ -74,7 +74,7 @@ class RoomGrid(MiniGridEnv):
         room_size: int = 7,
         num_rows: int = 3,
         num_cols: int = 3,
-        max_steps: int = 100,
+        max_steps: int = 10, #should be 100
         agent_view_size: int = 7,
         **kwargs,
     ):
